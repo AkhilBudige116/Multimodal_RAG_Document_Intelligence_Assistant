@@ -1,6 +1,6 @@
 # Multimodal RAG Document Intelligence Assistant
 
-Ask questions about PDFs, scanned documents, images, charts, tables, spreadsheets, audio and video, all through **one** FAISS-based RAG pipeline. The whole app (Streamlit frontend + backend) lives in a single file, `app.py`.
+Ask questions about PDFs, scanned documents, images, charts, tables, spreadsheets, audio and video, all through **one** LangChain-backed FAISS RAG pipeline. The whole app (Streamlit frontend + backend) lives in a single file, `app.py`.
 
 ## 1. Project Overview
 
@@ -23,7 +23,7 @@ The answer is simple: convert every modality into *text with metadata*, then run
 - Understand how text, image, table, audio and video content can share one vector index.
 - Keep metadata (filename, type, page, table id, timestamp, image reference) attached to every piece of content.
 - Answer only from retrieved content, and show which sources were used.
-- Keep the code beginner-friendly: simple functions, no classes, no agents.
+- Keep the application workflow simple: custom modality extraction plus focused LangChain components for embeddings, vector search and LLM calls.
 
 ## 3. Technology Stack
 
@@ -37,8 +37,9 @@ The answer is simple: convert every modality into *text with metadata*, then run
 | Audio | Faster-Whisper |
 | Video | OpenCV, FFmpeg |
 | Embeddings | Sentence Transformers `all-MiniLM-L6-v2` |
-| Vector database | FAISS (CPU), `IndexFlatIP` with normalized vectors (cosine similarity) |
-| LLM | Groq (`openai/gpt-oss-120b` by default, configurable) |
+| RAG orchestration | LangChain Core and LangChain Community |
+| Vector database | LangChain FAISS wrapper over FAISS (CPU), `IndexFlatIP` with normalized vectors (cosine similarity) |
+| LLM integration | LangChain Groq (`openai/gpt-oss-120b` by default, configurable) |
 
 ## 4. Architecture
 
@@ -59,15 +60,18 @@ flowchart TD
     V2 --> A1
     P1 & P3 & P4 & I1 & T1 & A1 --> C[Content items: text + metadata]
     C --> S[split_into_chunks]
-    S --> E[Sentence Transformer embeddings]
-    E --> F[(FAISS index + metadata)]
+    S --> D[LangChain Documents]
+    D --> E[Sentence Transformer embeddings adapter]
+    E --> F[(LangChain FAISS store + metadata)]
     Q[User question] --> QE[Question embedding]
     QE --> F
-    F -->|top 5 chunks| G[Groq LLM]
+    F -->|top 5 chunks| G[LangChain ChatGroq]
     G --> ANS[Answer + sources + image and table previews]
 ```
 
 ## 5. Multimodal RAG Workflow
+
+The modality-specific extraction code remains custom so PDFs, images, tables, audio and video keep their existing behavior. LangChain is used only for the RAG orchestration layer: the MiniLM model is exposed through a LangChain embeddings adapter, chunks are stored as LangChain `Document` objects in the LangChain FAISS wrapper, retrieval uses LangChain similarity search, and responses are generated with LangChain `ChatGroq`. The existing chunking rules, normalized cosine search, top-5 limit, metadata, page/timestamp pinning and prompts are preserved.
 
 1. **Upload** – any mix of supported files.
 2. **Extract** – each file type is routed to its own extraction function (`process_file`).

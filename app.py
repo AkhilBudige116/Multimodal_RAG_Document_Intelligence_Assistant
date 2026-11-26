@@ -42,6 +42,12 @@ import pymupdf  # PyMuPDF
 import pytesseract
 import streamlit as st
 from dotenv import load_dotenv
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_community.vectorstores import FAISS as LangChainFAISS
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_groq import ChatGroq
 from PIL import Image
 from sentence_transformers import SentenceTransformer
 
@@ -745,31 +751,54 @@ def load_embedding_model():
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 
-def generate_embeddings(texts):
-    """Turn texts into vectors. Similar meaning -> similar numbers."""
-    model = load_embedding_model()
-    vectors = model.encode(texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True)
-    return np.asarray(vectors, dtype="float32")
+class SentenceTransformerEmbeddings(Embeddings):
+    """LangChain adapter that preserves the existing embedding model/settings."""
+
+    @staticmethod
+    def _normalise(vectors):
+        values = np.asarray(vectors, dtype="float32")
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        return values / np.maximum(norms, 1e-12)
+
+    def embed_documents(self, texts):
+        model = load_embedding_model()
+        vectors = model.encode(
+            texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True)
+        return self._normalise(vectors).tolist()
+
+    def embed_query(self, text):
+        return self.embed_documents([text])[0]
 
 
 def create_vector_store(chunks):
-    """Embed every chunk and put the vectors in a FAISS index (cosine similarity)."""
-    vectors = generate_embeddings([chunk["search_text"] for chunk in chunks])
-    faiss.normalize_L2(vectors)  # normalised vectors: inner product == cosine similarity
-    index = faiss.IndexFlatIP(vectors.shape[1])
-    index.add(vectors)
-    return index  # metadata lives in `chunks`: vector i  <->  chunks[i]
+    """Create a LangChain FAISS store using the original cosine-search behavior."""
+    embedding = SentenceTransformerEmbeddings()
+    documents = [
+        Document(page_content=chunk["search_text"], metadata=chunk)
+        for chunk in chunks
+    ]
+    vectors = embedding.embed_documents([document.page_content for document in documents])
+    index = faiss.IndexFlatIP(len(vectors[0]))
+    vector_store = LangChainFAISS(
+        embedding_function=embedding,
+        index=index,
+        docstore=InMemoryDocstore(),
+        index_to_docstore_id={},
+    )
+    vector_store.add_embeddings(
+        [(document.page_content, vector)
+         for document, vector in zip(documents, vectors)],
+        metadatas=[document.metadata for document in documents],
+    )
+    return vector_store
 
 
 def retrieve_relevant_chunks(question, index, chunks, top_k=TOP_K):
-    """Return the top_k chunks most similar to the question, with their metadata."""
-    query = generate_embeddings([question])
-    faiss.normalize_L2(query)
-    scores, positions = index.search(query, min(top_k, index.ntotal))
+    """Retrieve the top_k chunks through LangChain's FAISS vector store."""
     results = []
-    for score, position in zip(scores[0], positions[0]):
-        if position != -1:
-            results.append({**chunks[position], "score": float(score)})
+    for document, score in index.similarity_search_with_score(
+        question, k=min(top_k, index.index.ntotal)):
+        results.append({**document.metadata, "score": float(score)})
 
     # Small helper for questions like "explain page 5" or "what happens at 30 seconds":
     # semantic search alone cannot understand numbers well, so pin matching chunks.
@@ -798,11 +827,15 @@ def retrieve_relevant_chunks(question, index, chunks, top_k=TOP_K):
 # -----------------------------------------------------------------------------
 # Groq answer generation
 # -----------------------------------------------------------------------------
-def get_groq_client():
+@st.cache_resource(show_spinner="Loading Groq model...")
+def get_groq_model():
     if not key_is_set("GROQ_API_KEY"):
         raise ValueError("GROQ_API_KEY is missing. Add it to the .env file and restart.")
-    from groq import Groq
-    return Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return ChatGroq(
+        model=GROQ_MODEL,
+        api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0,
+    )
 
 
 def generate_answer(question, retrieved_chunks=None, history=None):
@@ -811,12 +844,14 @@ def generate_answer(question, retrieved_chunks=None, history=None):
     Document mode: retrieved_chunks is a list and the answer must come from it.
     General mode:  retrieved_chunks is None and Groq answers directly.
     """
-    client = get_groq_client()
+    model = get_groq_model()
 
     if retrieved_chunks is None:
-        messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
-        messages += (history or [])[-6:]
-        messages.append({"role": "user", "content": question})
+        messages = [SystemMessage(content="You are a helpful AI assistant.")]
+        for message in (history or [])[-6:]:
+            message_type = HumanMessage if message["role"] == "user" else AIMessage
+            messages.append(message_type(content=message["content"]))
+        messages.append(HumanMessage(content=question))
     else:
         context = "\n\n".join(
             f"[{i}] {source_label(chunk)}\n{chunk['text']}"
@@ -829,13 +864,14 @@ def generate_answer(question, retrieved_chunks=None, history=None):
             "'The uploaded sources do not contain sufficient information to answer this question.' "
             "Never invent facts or numbers; when you calculate something from a table, "
             "use only the rows shown. Mention the passage numbers you used, like [1] or [2].")
-        messages = [{"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}]
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Context:\n{context}\n\nQuestion: {question}"),
+        ]
 
     try:
-        response = client.chat.completions.create(
-            model=GROQ_MODEL, messages=messages, temperature=0)
-        return response.choices[0].message.content
+        response = model.invoke(messages)
+        return response.content
     except Exception as error:
         raise RuntimeError(f"Groq API error: {error}")
 
